@@ -490,6 +490,145 @@ function opsInvolving(bottleId) {
   return { as_target: asTarget, as_source: asSource };
 }
 
+// ------------------------------------------------- 原瓶贡献量（精确分数）
+
+/** 大整数最大公约数（返回正值；gcd(0,x)=x，全 0 时返回 1）。 */
+function bgcd(a, b) {
+  a = a < 0n ? -a : a;
+  b = b < 0n ? -b : b;
+  while (b) { const t = a % b; a = b; b = t; }
+  return a || 1n;
+}
+
+/** 构造约分后的分数 { n, d }（BigInt，d 恒为正）。 */
+function frac(n, d) {
+  n = BigInt(n);
+  d = BigInt(d);
+  if (d === 0n) throw new Error('分数分母为 0');
+  if (n === 0n) return { n: 0n, d: 1n };
+  if (d < 0n) { n = -n; d = -d; }
+  const g = bgcd(n, d);
+  return { n: n / g, d: d / g };
+}
+const fadd = (a, b) => frac(a.n * b.d + b.n * a.d, a.d * b.d);
+const fmul = (a, b) => frac(a.n * b.n, a.d * b.d);
+
+/**
+ * 分数 → API JSON：
+ *  - numerator / denominator：约分后的分子、分母（字符串承载任意精度 BigInt）；
+ *  - text：约分文本（分母为 1 时省略分母），单位 mL；
+ *  - approx_ml：有限精度近似值（仅展示用，精确值以分子/分母为准）。
+ */
+function fracJson(f) {
+  const safe = f.n <= BigInt(Number.MAX_SAFE_INTEGER) && f.d <= BigInt(Number.MAX_SAFE_INTEGER);
+  return {
+    numerator: f.n.toString(),
+    denominator: f.d.toString(),
+    text: f.d === 1n ? f.n.toString() : `${f.n.toString()}/${f.d.toString()}`,
+    approx_ml: safe && f.n >= 0n ? Number(f.n) / Number(f.d) : null,
+  };
+}
+
+/**
+ * 构建原瓶贡献量索引。贡献量只取决于“瓶子形成图”（原瓶初始体积 + 衍生瓶创建操作
+ * 的来源与取用量），与操作时序、当前余量无关：
+ *  - 原瓶贡献 = 自身初始体积；
+ *  - 衍生瓶由来源瓶 S 取 v mL 形成时，S 中各原瓶贡献按 v / V_S 分摊
+ *    （V_S 为 S 形成时的总体积，内容视均匀）；
+ *  - 同一原瓶经不同路径汇入时合并（精确分数相加后约分）；
+ *  - 全程 BigInt 分数运算，不做逐层舍入，各项之和严格等于目标瓶形成体积；
+ *  - 来源瓶之后的剩余量变化不改变已形成瓶子的配比。
+ * 历史更正后调用方以最新台账重建索引，即完成所有下游贡献的重算；
+ * 被守恒规则拒绝的更正已回滚，形成图不变，结果自然不变。
+ */
+function buildCompositionIndex(origMap, derivedMap) {
+  const memo = new Map();
+  const compose = (id, stack) => {
+    const cached = memo.get(id);
+    if (cached) return cached;
+    if (origMap.has(id)) {
+      const v = origMap.get(id);
+      const r = { total: v, map: new Map([[id, frac(v, 1n)]]) };
+      memo.set(id, r);
+      return r;
+    }
+    const spec = derivedMap.get(id);
+    if (!spec) {
+      throw new ApiError(409, 'LINEAGE_BROKEN',
+        `瓶 ${id} 的来源谱系不完整（缺少形成操作记录或原瓶登记），无法计算原瓶贡献量`);
+    }
+    if (stack.includes(id)) {
+      throw new ApiError(409, 'LINEAGE_CYCLE',
+        `瓶 ${id} 的来源谱系存在循环引用，无法计算原瓶贡献量`);
+    }
+    stack.push(id);
+    const map = new Map();
+    let total = 0n;
+    for (const s of spec.sources) {
+      total += s.volume;
+      const sub = compose(s.bottle, stack);
+      const factor = frac(s.volume, sub.total); // 分摊比例 = 取用量 / 来源瓶形成总体积
+      for (const [origId, c] of sub.map) {
+        const share = fmul(c, factor);
+        map.set(origId, map.has(origId) ? fadd(map.get(origId), share) : share);
+      }
+    }
+    stack.pop();
+    const r = { total, map };
+    memo.set(id, r);
+    return r;
+  };
+  return {
+    /** 返回 { total: BigInt 形成总体积, map: 原瓶编号 -> 约分分数, sum: 各项合计分数 }。 */
+    get(id) {
+      const r = compose(id, []);
+      const sum = [...r.map.values()].reduce((acc, c) => fadd(acc, c), frac(0n, 1n));
+      return { total: r.total, map: r.map, sum };
+    },
+  };
+}
+
+/** 从当前已提交台账加载形成图：原瓶初始体积 + 每个衍生瓶创建操作的来源取用量。 */
+function loadCompositionMaps() {
+  const origMap = new Map();
+  db.prepare("SELECT id, initial_volume FROM bottles WHERE kind = 'original'").all()
+    .forEach((b) => origMap.set(b.id, BigInt(b.initial_volume)));
+  const byOp = new Map();
+  db.prepare('SELECT op_id, source_bottle, volume FROM operation_sources ORDER BY source_bottle').all()
+    .forEach((s) => {
+      if (!byOp.has(s.op_id)) byOp.set(s.op_id, []);
+      byOp.get(s.op_id).push({ bottle: s.source_bottle, volume: BigInt(s.volume) });
+    });
+  const derivedMap = new Map(); // 每个目标瓶只有唯一创建操作（编号冲突在写入时拦截）
+  db.prepare('SELECT op_id, target_bottle FROM operations ORDER BY seq').all().forEach((o) => {
+    if (!derivedMap.has(o.target_bottle)) {
+      derivedMap.set(o.target_bottle, { op_id: o.op_id, sources: byOp.get(o.op_id) || [] });
+    }
+  });
+  return { origMap, derivedMap };
+}
+
+/** 当前台账的贡献量索引（查询 / 更正后重算下游均用此入口）。 */
+function ledgerCompositionIndex() {
+  const { origMap, derivedMap } = loadCompositionMaps();
+  return buildCompositionIndex(origMap, derivedMap);
+}
+
+/** 组装贡献量查询响应体：原瓶编号、精确贡献量、形成总体积与各项合计。 */
+function contributionReport(index, bottleRow) {
+  const { total, map, sum } = index.get(bottleRow.id);
+  return {
+    bottle: bottleRow.id,
+    kind: bottleRow.kind,
+    created_by_op: bottleRow.created_op || null,
+    formation_volume: Number(total), // 取用量均为整数，形成体积为整数 mL
+    contributions: [...map.entries()]
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([origId, c]) => ({ bottle: origId, contribution_ml: fracJson(c) })),
+    sum_ml: fracJson(sum),
+  };
+}
+
 // ---------------------------------------------------------------- HTTP 层
 
 const app = express();
@@ -550,7 +689,24 @@ app.get('/api/bottles/:id', wrap((req, res) => {
   const b = qBottle.get(req.params.id);
   if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${req.params.id} 不存在`);
   const { balances } = recompute();
-  res.json({ ...b, remaining: balances.get(b.id) ?? 0, lineage: lineage(b.id), operations: opsInvolving(b.id) });
+  res.json({
+    ...b,
+    remaining: balances.get(b.id) ?? 0,
+    lineage: lineage(b.id),
+    operations: opsInvolving(b.id),
+    contributions: contributionReport(ledgerCompositionIndex(), b),
+  });
+}));
+
+/**
+ * 按瓶编号查询各原始瓶对该瓶的精确贡献量（分数 mL）：
+ * 返回原瓶编号、约分后的精确贡献量、目标瓶形成时总体积与各项合计；
+ * 原瓶 / 衍生瓶均可查询；瓶不存在 → 404 BOTTLE_NOT_FOUND。
+ */
+app.get('/api/bottles/:id/contributions', wrap((req, res) => {
+  const b = qBottle.get(req.params.id);
+  if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${req.params.id} 不存在`);
+  res.json(contributionReport(ledgerCompositionIndex(), b));
 }));
 
 app.get('/api/operations', wrap((req, res) => {
@@ -613,6 +769,36 @@ app.post('/api/batches/preview', wrap((req, res) => {
     index: i, op_id: it.op_id, ok: !itemErrors.has(i), errors: itemErrors.get(i) || [],
   }));
   const ok = topErrors.length === 0 && itemResults.every((r) => r.ok);
+
+  // 预计原瓶贡献：把格式完整的批次条目作为“虚拟形成图”叠加到当前台账之上
+  // （只依赖来源与取用量，不依赖余量 / 时序），逐条计算可行条目目标瓶的预计贡献。
+  // 该构图与提交后实际形成图一致，故提交后查询结果与预演必然相同；
+  // 预演不写库，台账版本与凭据逻辑不受影响。
+  const { origMap, derivedMap } = loadCompositionMaps();
+  items.forEach((it, i) => {
+    if (it.target && it.sources.length > 0 && !derivedMap.has(it.target)) {
+      derivedMap.set(it.target, {
+        op_id: it.op_id || `preview:${i}`,
+        sources: it.sources.map((s) => ({ bottle: s.bottle, volume: BigInt(s.volume) })),
+      });
+    }
+  });
+  const projectedIndex = buildCompositionIndex(origMap, derivedMap);
+  const projectedContributions = [];
+  for (const r of itemResults) {
+    if (!r.ok) continue;
+    const it = items[r.index];
+    try {
+      const rep = contributionReport(projectedIndex, { id: it.target, kind: 'derived', created_op: it.op_id });
+      projectedContributions.push({
+        index: r.index, op_id: it.op_id, target_bottle: it.target,
+        formation_volume: rep.formation_volume, contributions: rep.contributions, sum_ml: rep.sum_ml,
+      });
+    } catch (e) {
+      // 引用了谱系不完整的批内瓶（如前项因来源不存在而不可行），该条目不展示预计贡献
+    }
+  }
+
   const version = ledgerVersion();
   res.json({
     ok,
@@ -622,6 +808,7 @@ app.post('/api/batches/preview', wrap((req, res) => {
     errors: topErrors,
     items: itemResults,
     projected_balances: sim.projected,
+    projected_contributions: projectedContributions,
     commit_token: ok ? signCommitToken(version, planHash) : null,
     message: ok
       ? `预演通过：批次 ${batchId} 共 ${items.length} 条操作可提交；凭据已绑定当前台账（版本 ${version}），提交前若台账变化需重新预演`

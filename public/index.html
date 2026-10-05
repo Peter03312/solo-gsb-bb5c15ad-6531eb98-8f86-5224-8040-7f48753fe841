@@ -241,6 +241,8 @@ async function showBottle(id) {
       ${b.kind === 'original' ? '初始体积：' + b.initial_volume + ' mL　' : ''}
       <b>当前余量：${b.remaining} mL</b></p>
       <h4>来源谱系（向上追溯至原始瓶）</h4>${renderLineage(b.lineage)}
+      <h4>原瓶贡献量（精确分数 mL；形成时总体积 ${b.contributions.formation_volume} mL）</h4>
+      ${renderContributions(b.contributions)}
       <h4>相关操作</h4>`;
     if (b.operations.as_target.length) {
       html += '<p>由以下操作生成：</p><ul>' + b.operations.as_target.map(o =>
@@ -268,6 +270,24 @@ function renderLineage(node) {
     ? `<ul class="tree"><li>🧪 <span class="mono">${escapeHtml(node.bottle)}</span>（由操作 <span class="mono">${escapeHtml(node.op.op_id)}</span> 于 ${escapeHtml(node.op.op_time)} 生成）<ul class="tree">${children}</ul></li></ul>`
     : `<ul class="tree"><li class="mono">${escapeHtml(node.bottle)}</li></ul>`;
   return head;
+}
+
+// ---------- 原瓶贡献量（精确分数） ----------
+function fmtFrac(f) {
+  if (!f) return '—';
+  return f.approx_ml !== null && Number.isFinite(f.approx_ml) && f.denominator !== '1'
+    ? `${f.text}（≈${f.approx_ml.toFixed(6).replace(/0+$/, '').replace(/\.$/, '')} mL）`
+    : `${f.text} mL`;
+}
+function renderContributions(c) {
+  if (!c || !c.contributions || !c.contributions.length) return '<p class="hint">暂无贡献量数据。</p>';
+  let html = '<table><thead><tr><th>原始瓶编号</th><th class="num">精确贡献量 (mL)</th></tr></thead><tbody>';
+  for (const row of c.contributions) {
+    html += `<tr><td class="mono">${escapeHtml(row.bottle)}</td><td class="num mono">${fmtFrac(row.contribution_ml)}</td></tr>`;
+  }
+  html += `</tbody></table><p class="hint">各项合计：<span class="mono">${fmtFrac(c.sum_ml)}</span>` +
+    `（严格等于形成时总体积 ${c.formation_volume} mL，全程精确分数分摊、未逐层舍入）</p>`;
+  return html;
 }
 
 // ---------- 登记原始瓶 ----------
@@ -453,6 +473,13 @@ function renderBatchPreview(r) {
         `<td class="num ${b.remaining === 0 ? 'low' : ''}">${b.remaining}</td></tr>`;
     }
     html += '</tbody></table>';
+  }
+  if (r.projected_contributions && r.projected_contributions.length) {
+    html += '<h4>可行条目目标瓶的预计原瓶贡献（精确分数 mL，提交后查询结果与此一致）</h4>';
+    for (const pc of r.projected_contributions) {
+      html += `<p class="mono">第 ${pc.index + 1} 条 · ${escapeHtml(pc.op_id)} → ${escapeHtml(pc.target_bottle)}（形成时总体积 ${pc.formation_volume} mL）</p>`;
+      html += renderContributions(pc);
+    }
   }
   if (r.commit_token) {
     html += `<p class="hint">提交凭据已签发（绑定本计划与台账版本 ${r.ledger_version}）：` +
