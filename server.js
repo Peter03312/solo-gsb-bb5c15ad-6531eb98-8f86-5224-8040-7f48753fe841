@@ -116,6 +116,52 @@ function parseSources(raw) {
   });
 }
 
+// ---------------------------------------------------------------- 精确分数（BigInt）
+
+/**
+ * 贡献量全程使用 BigInt 分数运算，杜绝逐层四舍五入导致
+ * “各原瓶贡献之和 ≠ 目标瓶形成体积”。所有取用体积与初始体积均为整数，
+ * 贡献 = 初始体积 × 沿途各层 (取用量 / 来源瓶形成时总体积)，天然是有理数。
+ */
+function bgcd(a, b) {
+  if (a < 0n) a = -a;
+  if (b < 0n) b = -b;
+  while (b) { [a, b] = [b, a % b]; }
+  return a;
+}
+
+class Frac {
+  constructor(num, den) {
+    if (den === 0n) throw new Error('分数分母为零');
+    if (den < 0n) { num = -num; den = -den; }
+    const g = bgcd(num, den);
+    this.num = g === 0n ? 0n : num / g;
+    this.den = g === 0n ? 1n : den / g;
+  }
+  add(o) { return new Frac(this.num * o.den + o.num * this.den, this.den * o.den); }
+  /** this * (n / d)，结果约分。 */
+  mulRatio(n, d) { return new Frac(this.num * n, this.den * d); }
+}
+
+function fracJSON(f) {
+  return {
+    numerator: f.num.toString(),
+    denominator: f.den.toString(),
+    // 约分后的分数毫升：整数即 "40"，否则 "400/7"
+    volume: f.den === 1n ? f.num.toString() : `${f.num.toString()}/${f.den.toString()}`,
+    // 仅供页面展示的小近似值，一切核算以精确分数字段为准
+    approx_ml: Number(f.num * 1000000n / f.den) / 1000000,
+  };
+}
+
+/** 原瓶 -> 贡献分数 的 Map 序列化为响应数组（按瓶编号排序）。 */
+function contribsJSON(map) {
+  return [...map.entries()]
+    .filter(([, f]) => f && f.num !== 0n)
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([sourceBottle, f]) => ({ source_bottle: sourceBottle, ...fracJSON(f) }));
+}
+
 // ---------------------------------------------------------------- 预编译语句
 
 const qBottle     = db.prepare('SELECT * FROM bottles WHERE id = ?');
@@ -188,6 +234,85 @@ function replayLedger(bottleRows, ops) {
 function recompute() {
   const { bottles, ops } = loadLedger();
   return replayLedger(bottles, ops);
+}
+
+// ------------------------------------------- 原瓶贡献（精确分数，逐层比例分摊）
+
+/**
+ * 依据给定台账（bottleRows 与已按 (操作时间, 入库顺序) 排序的 ops），
+ * 计算每个瓶在“形成时”所含各原始瓶的精确体积贡献。
+ *
+ *  - 原始瓶：贡献 = {自身: 初始体积}。
+ *  - 衍生瓶：对每个来源瓶，取 取用量/来源瓶形成时总体积 的比例，
+ *    分摊来源瓶名下全部原瓶贡献；同一原瓶经不同路径汇入时合并（分数相加）。
+ *  - 后续余量变化（再被取用）不改变已形成瓶子的配比，故只依赖形成时的结构。
+ *
+ * 返回 Map<瓶编号, { formation_volume: BigInt, contribs: Map<原瓶编号, Frac> }>。
+ * 形成时总体积为 0 的来源瓶无法分摊，跳过（正常台账由正整数取用量保证不会出现）。
+ */
+function computeContributions(bottleRows, ops) {
+  const table = new Map();
+  for (const b of bottleRows) {
+    if (b.kind === 'original') {
+      const v = BigInt(b.initial_volume);
+      table.set(b.id, {
+        formation_volume: v,
+        contribs: b.initial_volume > 0 ? new Map([[b.id, new Frac(v, 1n)]]) : new Map(),
+      });
+    }
+  }
+  for (const op of ops) {
+    let formation = 0n;
+    const merged = new Map();
+    for (const s of op.sources) {
+      const draw = BigInt(s.volume);
+      formation += draw;
+      const src = table.get(s.bottle);
+      if (!src || src.formation_volume === 0n) continue;
+      for (const [orig, frac] of src.contribs) {
+        const part = frac.mulRatio(draw, src.formation_volume);
+        merged.set(orig, (merged.get(orig) || new Frac(0n, 1n)).add(part));
+      }
+    }
+    table.set(op.target_bottle, { formation_volume: formation, contribs: merged });
+  }
+  return table;
+}
+
+/** 当前已提交台账的全量原瓶贡献表。 */
+function currentContributions() {
+  const { bottles, ops } = loadLedger();
+  return computeContributions(bottles, ops);
+}
+
+/** 单个瓶的贡献查询响应；瓶不存在由调用方先校验。 */
+function contributionReport(bottleId) {
+  const table = currentContributions();
+  const entry = table.get(bottleId);
+  const b = qBottle.get(bottleId);
+  if (!entry) {
+    // 正常不会走到：瓶子存在则一定在贡献表中（原瓶或衍生瓶）
+    throw new ApiError(500, 'INTERNAL', '瓶贡献计算失败');
+  }
+  const list = contribsJSON(entry.contribs);
+  const totalFrac = list.reduce((acc, c) => {
+    const f = new Frac(BigInt(c.numerator), BigInt(c.denominator));
+    return acc ? acc.add(f) : f;
+  }, null) || new Frac(0n, 1n);
+  const totalVolume = Number(entry.formation_volume);
+  return {
+    bottle: bottleId,
+    kind: b.kind,
+    // 目标瓶形成时的总体积（mL，= 创建操作各来源取用量之和；原瓶为初始体积）
+    formation_volume: totalVolume,
+    // 各原瓶精确贡献（约分后的分数毫升），按原瓶编号排序
+    contributions: list,
+    // 守恒自检：各原瓶贡献之和必须恰好等于形成时总体积（精确分数比较）
+    sum_check: {
+      sum: fracJSON(totalFrac).volume,
+      equals_formation_volume: totalFrac.num === entry.formation_volume && totalFrac.den === 1n,
+    },
+  };
 }
 
 // ---------------------------------------------------------------- 业务事务
@@ -346,27 +471,60 @@ function validateBatchItems(items) {
 /**
  * 模拟重放：把批次条目作为虚拟操作（虚拟入库顺序 = 当前最大 seq 之后按录入顺序
  * 连续分配，与提交时的真实行为一致）追加到当前台账末尾，按 (操作时间, 入库顺序)
- * 全量重放。excludeIdx 中的条目（格式非法、无法模拟）不参与。
- * 返回 { conflicts, projected }，projected 为受影响瓶（批内来源 ∪ 目标）的预计余量。
+ * 全量重放。
+ *  - excludeReplay：无法参与重放的条目（格式非法）；
+ *  - excludeContrib：贡献推演中需剔除的条目（格式非法 或 编号/来源/时间业务非法），
+ *    避免“目标瓶与台账现有瓶同名”等非法条目覆盖现有瓶的贡献表。
+ * 返回 { conflicts, projected, contributions }：
+ *  - projected：受影响瓶（批内来源 ∪ 目标）的预计余量；
+ *  - contributions：批内每个结构合法条目的目标瓶预计原瓶贡献（精确分数，
+ *    与提交后 GET /api/bottles/:id/contributions 结果一致），按条目下标索引。
  */
-function simulateBatch(items, excludeIdx) {
+function simulateBatch(items, excludeReplay, excludeContrib) {
   const ledger = loadLedger();
   const baseSeq = ledger.ops.reduce((m, o) => Math.max(m, o.seq), 0);
-  const vBottles = [];
-  const vOps = [];
-  items.forEach((it, i) => {
-    if (excludeIdx.has(i)) return;
-    vBottles.push({ id: it.target, kind: 'derived', initial_volume: 0 });
-    vOps.push({
-      op_id: it.op_id, seq: baseSeq + vOps.length + 1, target_bottle: it.target, op_time: it.op_time,
-      sources: it.sources.map((s) => ({ bottle: s.bottle, volume: s.volume })),
+  const buildVirtual = (excludeIdx) => {
+    const vBottles = [];
+    const vOps = [];
+    items.forEach((it, i) => {
+      if (excludeIdx.has(i)) return;
+      vBottles.push({ id: it.target, kind: 'derived', initial_volume: 0 });
+      vOps.push({
+        op_id: it.op_id, seq: baseSeq + vOps.length + 1, target_bottle: it.target, op_time: it.op_time,
+        sources: it.sources.map((s) => ({ bottle: s.bottle, volume: s.volume })),
+      });
     });
-  });
+    return { vBottles, vOps };
+  };
+  const { vBottles, vOps } = buildVirtual(excludeReplay);
   const allOps = [...ledger.ops, ...vOps].sort(cmpOps);
   const { balances, conflicts } = replayLedger([...ledger.bottles, ...vBottles], allOps);
+
+  // 贡献只依赖形成时结构与取用量，不依赖余量；批内前项生成的瓶同样按比例分摊
+  const cVirtual = buildVirtual(excludeContrib);
+  const cOps = [...ledger.ops, ...cVirtual.vOps].sort(cmpOps);
+  const ctable = computeContributions([...ledger.bottles, ...cVirtual.vBottles], cOps);
+  const contributions = new Map();
+  items.forEach((it, i) => {
+    if (excludeContrib.has(i)) return;
+    const entry = ctable.get(it.target);
+    if (!entry) return;
+    const list = contribsJSON(entry.contribs);
+    const sum = list.reduce((acc, c) => {
+      const f = new Frac(BigInt(c.numerator), BigInt(c.denominator));
+      return acc ? acc.add(f) : f;
+    }, null) || new Frac(0n, 1n);
+    const exact = sum.num === entry.formation_volume && sum.den === 1n;
+    contributions.set(i, {
+      formation_volume: Number(entry.formation_volume),
+      contributions: list,
+      sum_check: { sum: fracJSON(sum).volume, equals_formation_volume: exact },
+    });
+  });
+
   const affected = new Set();
   items.forEach((it, i) => {
-    if (excludeIdx.has(i)) return;
+    if (excludeReplay.has(i)) return;
     affected.add(it.target);
     for (const s of it.sources) affected.add(s.bottle);
   });
@@ -375,7 +533,7 @@ function simulateBatch(items, excludeIdx) {
     in_batch: vBottles.some((b) => b.id === id),
     remaining: balances.get(id) ?? 0,
   }));
-  return { conflicts, projected };
+  return { conflicts, projected, contributions };
 }
 
 /** 批次计划的规范化内容哈希：绑定批次号与全部条目，用于凭据与幂等判定。 */
@@ -550,7 +708,28 @@ app.get('/api/bottles/:id', wrap((req, res) => {
   const b = qBottle.get(req.params.id);
   if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${req.params.id} 不存在`);
   const { balances } = recompute();
-  res.json({ ...b, remaining: balances.get(b.id) ?? 0, lineage: lineage(b.id), operations: opsInvolving(b.id) });
+  res.json({
+    ...b,
+    remaining: balances.get(b.id) ?? 0,
+    // 本轮新增：该瓶形成时各原始瓶的精确（分数 mL）贡献与形成时总体积
+    contribution: contributionReport(b.id),
+    lineage: lineage(b.id),
+    operations: opsInvolving(b.id),
+  });
+}));
+
+/**
+ * 按瓶编号查询原瓶贡献（本轮新增）。
+ * 返回原瓶编号、约分后的精确贡献量（分数毫升）及目标瓶形成时总体积；
+ * 同一原瓶经不同路径汇入已合并；贡献依据当前已提交台账实时重算，
+ * 历史来源/取用量更正（成功的）立即反映，被守恒规则拒绝的更正不改变结果。
+ * 瓶不存在 → 404 BOTTLE_NOT_FOUND。
+ */
+app.get('/api/bottles/:id/contributions', wrap((req, res) => {
+  if (!qBottle.get(req.params.id)) {
+    throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${req.params.id} 不存在`);
+  }
+  res.json(contributionReport(req.params.id));
 }));
 
 app.get('/api/operations', wrap((req, res) => {
@@ -594,11 +773,14 @@ app.post('/api/batches/preview', wrap((req, res) => {
     if (!itemErrors.has(i)) itemErrors.set(i, []);
     itemErrors.get(i).push(...errs);
   }
-  // 模拟重放：格式非法的条目无法参与，其余条目按计划追加到当前台账末尾
+  // 模拟重放：格式非法的条目无法参与，其余条目按计划追加到当前台账末尾。
+  // 贡献推演额外剔除编号/来源/时间等业务非法条目，防止覆盖同名现有瓶的贡献。
   const brokenIdx = new Set([...itemErrors.keys()].filter((i) => !items[i].op_id || !items[i].op_time || !items[i].target));
-  const sim = simulateBatch(items, brokenIdx);
+  const bizBrokenIdx = new Set(biz.keys());
+  const sim = simulateBatch(items, brokenIdx, new Set([...brokenIdx, ...bizBrokenIdx]));
   const opToIdx = new Map();
   items.forEach((it, i) => { if (it.op_id && !opToIdx.has(it.op_id)) opToIdx.set(it.op_id, i); });
+  // 超用条目同样不展示预计贡献（其目标瓶在该重放下未形成有效配比）
   for (const c of sim.conflicts) {
     const err = { code: 'OVERDRAW', message: `超用：从瓶 ${c.bottle} 需取 ${c.requested} mL，该时刻可用仅 ${c.available} mL` };
     if (opToIdx.has(c.op_id)) {
@@ -609,8 +791,15 @@ app.post('/api/batches/preview', wrap((req, res) => {
       topErrors.push({ code: 'LEDGER_CONFLICT', message: `现有台账操作 ${c.op_id} 从瓶 ${c.bottle} 需取 ${c.requested} mL，可用仅 ${c.available} mL` });
     }
   }
+  const overdrawIdx = new Set(
+    sim.conflicts.filter((c) => opToIdx.has(c.op_id)).map((c) => opToIdx.get(c.op_id))
+  );
   const itemResults = items.map((it, i) => ({
     index: i, op_id: it.op_id, ok: !itemErrors.has(i), errors: itemErrors.get(i) || [],
+    // 仅可行条目展示预计原瓶贡献（精确分数）；非法或超用条目为 null
+    projected_contribution: itemErrors.has(i) || overdrawIdx.has(i) || !sim.contributions.has(i)
+      ? null
+      : sim.contributions.get(i),
   }));
   const ok = topErrors.length === 0 && itemResults.every((r) => r.ok);
   const version = ledgerVersion();

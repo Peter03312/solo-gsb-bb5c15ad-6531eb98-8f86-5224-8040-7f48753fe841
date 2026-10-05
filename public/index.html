@@ -50,6 +50,10 @@ h4{margin:14px 0 6px;font-size:14px}
 .batch-item>.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:2px}
 .batch-item>.head b{font-size:13px;color:#44515d}
 .ok-text{color:var(--ok);font-weight:600}
+.frac{font-family:ui-monospace,Consolas,monospace;white-space:nowrap}
+.frac .ap{color:#6b7885;font-size:12px;margin-left:6px}
+.contrib-badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;background:#e6f4ea;color:var(--ok);margin-left:8px}
+.contrib-badge.bad{background:#fdecea;color:var(--err)}
 </style>
 </head>
 <body>
@@ -69,6 +73,16 @@ h4{margin:14px 0 6px;font-size:14px}
 
 <!-- ============ 瓶子总览 ============ -->
 <section id="tab-bottles">
+  <div class="card">
+    <h3>原瓶贡献查询（按瓶编号）</h3>
+    <div class="src-row">
+      <input type="text" list="bottleList" id="contrib_id" placeholder="输入瓶编号（原始瓶 / 衍生瓶均可）" style="flex:2">
+      <button class="btn small" id="contribSubmit" type="button">查询贡献</button>
+    </div>
+    <p class="hint">列出目标瓶形成时各原始瓶的<b>精确贡献量（约分后的分数毫升）</b>、形成时总体积与守恒自检；
+      同一原瓶经不同路径汇入自动合并。结果依据当前已提交台账实时重算，历史更正生效后随之变化。</p>
+    <div id="contribResult"></div>
+  </div>
   <div class="card">
     <h3>瓶子总览（当前余量）</h3>
     <table id="bottleTable">
@@ -204,6 +218,34 @@ document.querySelectorAll('nav button').forEach(btn => {
   });
 });
 
+// ---------- 原瓶贡献查询 ----------
+function renderContribution(r) {
+  const rows = r.contributions.map(c =>
+    `<tr><td class="mono">${escapeHtml(c.source_bottle)}</td>` +
+    `<td class="frac">${escapeHtml(c.volume)} mL<span class="ap">≈ ${c.approx_ml} mL</span></td></tr>`).join('');
+  const check = r.sum_check && r.sum_check.equals_formation_volume
+    ? '<span class="contrib-badge">✓ 各原瓶贡献之和 = 形成时总体积</span>'
+    : '<span class="contrib-badge bad">✗ 贡献之和与形成体积不一致</span>';
+  return `<h4>瓶 <span class="mono">${escapeHtml(r.bottle)}</span> 的原瓶贡献` +
+    `（${r.kind === 'original' ? '原始瓶' : '衍生瓶'}）</h4>` +
+    `<p>形成时总体积：<b class="frac">${r.formation_volume} mL</b>　原瓶数：${r.contributions.length} ${check}</p>` +
+    `<table><thead><tr><th>原瓶编号</th><th>精确贡献量（分数毫升）</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function queryContribution() {
+  const id = $('contrib_id').value.trim();
+  const box = $('contribResult');
+  if (!id) { box.innerHTML = '<p class="low">请输入瓶编号。</p>'; return; }
+  try {
+    const r = await api('/api/bottles/' + encodeURIComponent(id) + '/contributions');
+    box.innerHTML = renderContribution(r);
+  } catch (e) {
+    box.innerHTML = `<p class="low">${escapeHtml(e.message || '查询失败')}</p>`;
+  }
+}
+$('contribSubmit').addEventListener('click', queryContribution);
+$('contrib_id').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') queryContribution(); });
+
 // ---------- 瓶子总览 ----------
 async function loadBottles() {
   const rows = await api('/api/bottles');
@@ -240,6 +282,7 @@ async function showBottle(id) {
       创建/采样时间：${escapeHtml(b.created_time)}
       ${b.kind === 'original' ? '初始体积：' + b.initial_volume + ' mL　' : ''}
       <b>当前余量：${b.remaining} mL</b></p>
+      <h4>原瓶贡献（形成时，精确分数毫升）</h4>${renderContribution(b.contribution)}
       <h4>来源谱系（向上追溯至原始瓶）</h4>${renderLineage(b.lineage)}
       <h4>相关操作</h4>`;
     if (b.operations.as_target.length) {
@@ -437,10 +480,19 @@ function renderBatchPreview(r) {
   if (r.errors && r.errors.length) {
     html += '<p class="low">' + r.errors.map(e => escapeHtml(e.message)).join('<br>') + '</p>';
   }
-  html += '<table><thead><tr><th>#</th><th>操作号</th><th>可行性</th><th>问题</th></tr></thead><tbody>';
+  html += '<table><thead><tr><th>#</th><th>操作号</th><th>可行性</th><th>目标瓶预计原瓶贡献</th><th>问题</th></tr></thead><tbody>';
   for (const it of r.items) {
+    let pcHtml = '—';
+    if (it.projected_contribution) {
+      const pc = it.projected_contribution;
+      const okBadge = pc.sum_check && pc.sum_check.equals_formation_volume ? ' ✓' : '';
+      pcHtml = `<div>形成体积 <b class="frac">${pc.formation_volume} mL</b>${okBadge}</div>` +
+        (pc.contributions || []).map(c =>
+          `<div class="frac" style="font-size:12px">${escapeHtml(c.source_bottle)}：${escapeHtml(c.volume)} mL<span class="ap">≈${c.approx_ml}</span></div>`).join('');
+    }
     html += `<tr><td>${it.index + 1}</td><td class="mono">${escapeHtml(it.op_id || '—')}</td>` +
       `<td>${it.ok ? '<span class="ok-text">✓ 可行</span>' : '<span class="low">✗ 不可行</span>'}</td>` +
+      `<td>${pcHtml}</td>` +
       `<td>${it.errors.length ? it.errors.map(e => escapeHtml(e.message)).join('<br>') : '—'}</td></tr>`;
   }
   html += '</tbody></table>';

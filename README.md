@@ -1,7 +1,8 @@
 # 水质实验室 · 样本分装与混样溯源工作台
 
 基于 **Node.js + Express + SQLite（better-sqlite3）** 的 Web 工作台，用于管理水质样本的
-原瓶登记、分装 / 混样操作、**批次预演与两阶段提交**、余量守恒校验、完整来源谱系追溯与历史操作更正。
+原瓶登记、分装 / 混样操作、**批次预演与两阶段提交**、余量守恒校验、完整来源谱系追溯、历史操作更正，
+以及按瓶编号查看**各原始瓶的精确（分数毫升）体积贡献**。
 
 ## 一键启动（Docker Compose）
 
@@ -34,13 +35,17 @@ npm start          # 访问 http://localhost:3000
 ## 页面功能
 
 - **瓶子总览**：每个瓶的类型（原始瓶 / 衍生瓶）、创建或采样时间、初始体积、当前余量；
-  点击任意行查看该瓶的**完整来源谱系**（向上递归至原始瓶）及相关操作记录。
+  点击任意行查看该瓶的**完整来源谱系**及相关操作记录。
+- **原瓶贡献查询（本轮新增）**：按瓶编号查看衍生瓶由各**原始瓶**贡献的体积——
+  原瓶编号、**约分后的精确贡献量（分数毫升）**、目标瓶**形成时总体积**及守恒自检，
+  同一原瓶经不同路径汇入自动合并；瓶详情中同步展示。
 - **登记原始瓶**：录入瓶编号、采样时间、初始体积（mL，正整数）。
 - **新建分装 / 混样**：录入唯一操作号、目标瓶编号（须为新编号）、操作时间、
   一个或多个来源瓶及各自取用体积；目标瓶体积 = 取用量之和。
 - **批量预演 / 提交**：把连续分装 / 混样作为一个批次处理。录入批次号与按录入顺序排列的
   多条操作（每条沿用操作号、目标瓶、操作时间、来源瓶与取用毫升数），先**预演**查看逐条可行性、
-  受影响瓶预计余量与提交凭据（不写入数据），再凭凭据**提交**整批；批内可引用前项生成的瓶。
+  受影响瓶预计余量、**可行条目目标瓶的预计原瓶贡献（精确分数）**与提交凭据（不写入数据），
+  再凭凭据**提交**整批；批内可引用前项生成的瓶。
 - **操作记录与更正**：列出全部操作（含所属批次号）；点“更正”可修改该操作的来源与取用量，
   提交后按操作顺序重算相关瓶余量。
 
@@ -76,15 +81,18 @@ curl -s http://localhost:3000/api/batches/preview -H 'Content-Type: application/
     {"op_id":"OP-0102","target_bottle":"ALQ-101","op_time":"2026-10-04T10:00",
      "sources":[{"bottle":"MIX-101","volume":150}]}
   ]}'
-# → {"ok":true,"items":[{"index":0,"op_id":"OP-0101","ok":true,"errors":[]},...],
+# → {"ok":true,"items":[{"index":0,"op_id":"OP-0101","ok":true,"errors":[],
+#       "projected_contribution":{"formation_volume":300,"contributions":[
+#         {"source_bottle":"W2026-001","volume":"200",...},
+#         {"source_bottle":"W2026-002","volume":"100",...}], ...}},...],
 #    "projected_balances":[{"bottle":"MIX-101","in_batch":true,"remaining":150},...],
-#    "commit_token":"v1.3.<plan_hash>.<hmac>", ...}
+#    "commit_token":"v1.1.<plan_hash>.<hmac>", ...}
 
 # 2) 提交（携带预演返回的 commit_token，单事务整批落库）
 curl -s http://localhost:3000/api/batches/commit -H 'Content-Type: application/json' -d '{
   "batch_id": "BATCH-0001",
   "items": [ …与预演完全相同的条目… ],
-  "commit_token": "v1.3.<plan_hash>.<hmac>"
+  "commit_token": "v1.1.<plan_hash>.<hmac>"
 }'
 # → 201 {"ok":true,"committed":2,"projected_balances":[...]}
 #    重复提交相同内容 → 200 {"ok":true,"idempotent":true,...}
@@ -96,6 +104,71 @@ curl -s http://localhost:3000/api/batches/BATCH-0001 # 批次详情（按录入�
 
 提交成功后，批内操作立即进入现有的余量（`GET /api/bottles`）、操作记录
 （`GET /api/operations`，含 `batch_id` 字段）与谱系查询（`GET /api/bottles/:id`）。
+
+## 原瓶贡献查询（本轮新增）
+
+按瓶编号查看该瓶（原始瓶或衍生瓶）在**形成时**所含各原始瓶的精确体积贡献：
+
+- 原始瓶的贡献为其**自身初始体积**；
+- 分装 / 混样取用某来源瓶时，视内容物均匀，按 **取用量 ÷ 来源瓶形成时总体积** 的比例
+  把来源瓶名下各原瓶贡献分摊到目标瓶；
+- 同一原瓶经不同路径汇入目标瓶时**合并**（分数相加后约分）；
+- 贡献量全程使用 **BigInt 分数运算**，以**约分后的分数毫升**返回（如 `400/7`），
+  不做逐层四舍五入，故各原瓶贡献之和**精确等于**目标瓶形成时总体积
+  （响应中的 `sum_check.equals_formation_volume` 恒为 `true`，可据此自检）；
+- 配比只取决于瓶子**形成时**的结构与取用量；形成后剩余量再变化（被后续操作取用）
+  **不改变**已形成瓶子的配比；
+- 历史来源或取用量**更正成功后**，查询依据当前已提交台账**实时重算全部下游贡献**；
+  被现有守恒规则拒绝（会导致后续超用）的更正整次回滚、台账不变，查询结果也不变。
+
+### 调用示例
+
+```bash
+# 按瓶编号查询原瓶贡献（衍生瓶）
+curl -s http://localhost:3000/api/bottles/ALQ-001/contributions
+# → {
+#     "bottle": "ALQ-001", "kind": "derived",
+#     "formation_volume": 100,                       # 目标瓶形成时总体积 (mL)
+#     "contributions": [
+#       {"source_bottle":"W2026-001","numerator":"400","denominator":"7",
+#        "volume":"400/7","approx_ml":57.142857},    # 精确分数毫升 + 展示用近似值
+#       {"source_bottle":"W2026-002","numerator":"300","denominator":"7",
+#        "volume":"300/7","approx_ml":42.857142}
+#     ],
+#     "sum_check":{"sum":"100","equals_formation_volume":true}
+#   }
+# 说明：MIX-001 形成体积 350（001 取 200 + 002 取 150），从 MIX-001 取 100 时
+#       001 分摊 100×200/350 = 400/7，002 分摊 100×150/350 = 300/7，合计恰为 100。
+
+# 原始瓶查询其自身
+curl -s http://localhost:3000/api/bottles/W2026-001/contributions
+# → {"bottle":"W2026-001","kind":"original","formation_volume":1000,
+#    "contributions":[{"source_bottle":"W2026-001","volume":"1000",...}], ...}
+
+# 瓶不存在 → 404 BOTTLE_NOT_FOUND（与既有 /api/bottles/:id 错误语义一致）
+curl -s -w '[%{http_code}]' http://localhost:3000/api/bottles/NO-SUCH/contributions
+# → {"error":{"code":"BOTTLE_NOT_FOUND","message":"瓶 NO-SUCH 不存在","details":null}} [404]
+```
+
+`GET /api/bottles/:id` 的既有响应保持兼容，并在其中**新增内嵌字段** `contribution`
+（结构与上面的独立接口相同）；工作台“瓶子总览”页提供查询框，点击瓶行的详情中也同步展示。
+
+### 批次预演中的预计贡献
+
+`POST /api/batches/preview` 的逐条结果 `items[]` 新增 `projected_contribution` 字段：
+**可行条目**给出其目标瓶在“当前台账 + 本批计划”下的预计原瓶贡献（精确分数，批内引用前项
+生成的瓶同样按比例分摊）与形成体积；不可行条目（校验失败 / 超用）为 `null`。预演不写库，
+**提交后**对相应瓶调用贡献查询，结果与预演中的预计贡献**完全一致**；台账变化导致凭据失效
+仍按既有规则（`STALE_TOKEN` / `PLAN_CHANGED`）拒绝提交。
+
+```bash
+# 预演响应片段
+# {"ok":true,"items":[{"index":0,"op_id":"OP-B1","ok":true,
+#    "projected_contribution":{"formation_volume":90,"contributions":[
+#      {"source_bottle":"W2026-001","volume":"30",...},
+#      {"source_bottle":"W2026-002","volume":"60",...}],
+#      "sum_check":{"sum":"90","equals_formation_volume":true}}}, ...]}
+```
 
 ## 业务规则与一致性设计
 
@@ -127,12 +200,13 @@ curl -s http://localhost:3000/api/batches/BATCH-0001 # 批次详情（按录入�
 | `POST` | `/api/bottles` | 登记原始瓶 `{bottle_id, sample_time, initial_volume}` |
 | `POST` | `/api/operations` | 新建操作 `{op_id, target_bottle, op_time, sources:[{bottle, volume}]}` |
 | `POST` | `/api/operations/:op_id/correct` | 更正取用量 `{sources:[{bottle, volume}]}` |
-| `POST` | `/api/batches/preview` | 批次预演（不写库）`{batch_id, items:[{op_id, target_bottle, op_time, sources}]}` → 逐条可行性 + 预计余量 + `commit_token` |
+| `POST` | `/api/batches/preview` | 批次预演（不写库）`{batch_id, items:[{op_id, target_bottle, op_time, sources}]}` → 逐条可行性 + 预计余量 + **可行条目的预计原瓶贡献 `projected_contribution`** + `commit_token` |
 | `POST` | `/api/batches/commit` | 批次提交（单事务）`{batch_id, items, commit_token}` → 201 / 幂等 200 / 冲突 409 |
 | `GET`  | `/api/batches` | 全部已提交批次 |
 | `GET`  | `/api/batches/:batch_id` | 批次详情（按录入顺序的条目及来源） |
 | `GET` | `/api/bottles` | 全部瓶及当前余量 |
-| `GET` | `/api/bottles/:id` | 单瓶详情：余量、来源谱系、相关操作 |
+| `GET` | `/api/bottles/:id` | 单瓶详情：余量、来源谱系、相关操作、原瓶精确贡献（内嵌 `contribution`） |
+| `GET` | `/api/bottles/:id/contributions` | **（本轮新增）** 按瓶编号查原瓶贡献：原瓶编号 + 约分后的精确分数贡献量 + 形成时总体积；瓶不存在 → 404 `BOTTLE_NOT_FOUND` |
 | `GET` | `/api/operations` | 全部操作记录（含来源明细、目标体积与所属批次号 `batch_id`） |
 
 时间格式统一为 `YYYY-MM-DDTHH:MM`（页面用 `datetime-local` 控件），体积单位为毫升（正整数）。
@@ -143,6 +217,6 @@ curl -s http://localhost:3000/api/batches/BATCH-0001 # 批次详情（按录入�
 ├── Dockerfile            # node:20，构建时安装依赖，启动时确保依赖并初始化数据
 ├── docker-compose.yml    # 一键启动，映射 3000 端口，named volume 持久化数据
 ├── package.json
-├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交
-└── public/index.html     # 单页工作台（总览 / 登记 / 操作 / 批量预演提交 / 记录与更正）
+├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶精确分数贡献
+└── public/index.html     # 单页工作台（总览 / 贡献查询 / 登记 / 操作 / 批量预演提交 / 记录与更正）
 ```
